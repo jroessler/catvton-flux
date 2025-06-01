@@ -416,7 +416,6 @@ def main(args):
         log_with=args.report_to,
         project_config=accelerator_project_config,
         kwargs_handlers=[kwargs],
-        cpu=True # TODO
     )
 
     # Disable AMP for MPS.
@@ -455,11 +454,8 @@ def main(args):
                 exist_ok=True,
             ).repo_id
 
-    ######## NEW
-
-    # ACCELERATE
     pipe = FluxFillPipeline.from_pretrained(
-        "/home/lyra/development/consolidated-comfyui-models/diffusers/flux-fill-dev",
+        "black-forest-labs/FLUX.1-Fill-dev",
         torch_dtype=torch.bfloat16
     )
 
@@ -478,8 +474,6 @@ def main(args):
                 param.requires_grad = True
 
     noise_scheduler_copy = copy.deepcopy(pipe.scheduler)
-
-    ########
 
     vae_scale_factor = (
         2 ** (len(pipe.vae.config.block_out_channels) - 1) if pipe.vae is not None else 8
@@ -510,8 +504,7 @@ def main(args):
             "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
         )
 
-    # TODO
-    # pipe.to(accelerator.device, dtype=weight_dtype)
+    pipe.to(accelerator.device, dtype=weight_dtype)
 
     if args.gradient_checkpointing:
         if args.train_base_model:
@@ -734,11 +727,11 @@ def main(args):
         num_cycles=args.lr_num_cycles,
         power=args.lr_power,
     )
-    # TODO
-#    if args.train_base_model:
-#        pipe.transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-#            pipe.transformer, optimizer, train_dataloader, lr_scheduler
-#        )
+
+    if args.train_base_model:
+        pipe.transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            pipe.transformer, optimizer, train_dataloader, lr_scheduler
+        )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
