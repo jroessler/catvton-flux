@@ -74,89 +74,109 @@ def prepare_image_with_mask(
         return packed_control_image, height, width
 
 def prepare_fill_with_mask(
-        image_processor,
-        mask_processor,
-        vae,
-        vae_scale_factor,
-        image,
-        mask,
-        width,
-        height,
-        batch_size,
-        num_images_per_prompt,
-        device,
-        dtype,
-    ):
+    vae,
+    vae_scale_factor,
+    on_model_image_masked,  # [B, C, H, W] in pixel space
+    flatlay_image,          # [B, C, H, W] in pixel space
+    inpaint_mask,           # [B, 1, H, W] in pixel space
+    batch_size,
+    num_images_per_prompt,
+    device,
+    dtype,
+):
     """
-    Prepares image and mask for fill operation with proper rearrangement.
-    Focuses only on image and mask processing.
+    Prepares latents and mask for fill operation with separate encoding of on_model_image_masked and flatlay_image.
+    Concatenates latents after encoding and processes inpaint_mask accordingly.
     """
-    # Determine effective batch size
     effective_batch_size = batch_size * num_images_per_prompt
-    
-    # Prepare image
-    if isinstance(image, torch.Tensor):
-        pass
+
+    # Repeat inputs if needed
+    if on_model_image_masked.shape[0] == 1:
+        on_model_image_masked = on_model_image_masked.repeat(effective_batch_size, 1, 1, 1)
     else:
-        image = image_processor.preprocess(image, height=height, width=width)
+        on_model_image_masked = on_model_image_masked.repeat(num_images_per_prompt, 1, 1, 1)
 
-    image_batch_size = image.shape[0]
-    repeat_by = effective_batch_size if image_batch_size == 1 else num_images_per_prompt
-    image = image.repeat_interleave(repeat_by, dim=0)
-    image = image.to(device=device, dtype=dtype)
-
-    # Prepare mask with specific processing
-    if isinstance(mask, torch.Tensor):
-        pass
+    if flatlay_image.shape[0] == 1:
+        flatlay_image = flatlay_image.repeat(effective_batch_size, 1, 1, 1)
     else:
-        mask = mask_processor.preprocess(mask, height=height, width=width)
+        flatlay_image = flatlay_image.repeat(num_images_per_prompt, 1, 1, 1)
 
-    mask = mask.repeat_interleave(repeat_by, dim=0)
-    mask = mask.to(device=device, dtype=dtype)
+    if inpaint_mask.shape[0] == 1:
+        inpaint_mask = inpaint_mask.repeat(effective_batch_size, 1, 1, 1)
+    else:
+        inpaint_mask = inpaint_mask.repeat(num_images_per_prompt, 1, 1, 1)
 
-    # Apply mask to image
-    masked_image = image.clone()
-    masked_image = masked_image * (1 - mask)
+    # Move to device and dtype
+    on_model_image_masked = on_model_image_masked.to(device=device, dtype=dtype)
+    flatlay_image = flatlay_image.to(device=device, dtype=dtype)
+    inpaint_mask = inpaint_mask.to(device=device, dtype=dtype)
 
-    # Encode to latents
-    image_latents = vae.encode(masked_image.to(vae.dtype)).latent_dist.sample()
-    image_latents = (
-        image_latents - vae.config.shift_factor
-    ) * vae.config.scaling_factor
-    image_latents = image_latents.to(dtype)
+    # Encode images separately
+    on_model_latents = vae.encode(on_model_image_masked.to(vae.dtype)).latent_dist.sample()
+    flatlay_latents = vae.encode(flatlay_image.to(vae.dtype)).latent_dist.sample()
 
-    # Process mask following the example's specific rearrangement
-    mask = mask[:, 0, :, :] if mask.shape[1] > 1 else mask[:, 0, :, :]
-    mask = mask.to(torch.bfloat16)
-    
+    # Adjust latents
+    on_model_latents = (on_model_latents - vae.config.shift_factor) * vae.config.scaling_factor
+    flatlay_latents = (flatlay_latents - vae.config.shift_factor) * vae.config.scaling_factor
+
+    on_model_latents = on_model_latents.to(dtype)
+    flatlay_latents = flatlay_latents.to(dtype)
+
+    # Concatenate latents along width (dim=3)
+    composite_latents = torch.cat([flatlay_latents, on_model_latents], dim=3)  # [B, C, H', 2*W']
+
+    # Resize inpaint_mask to latent spatial size
+    latent_height = on_model_latents.shape[2]  # H'
+    latent_width = on_model_latents.shape[3]   # W'
+    # The concatenated latent is [B, C, H', 2*W']
+
+    # Prepare mask for the concatenated latent:
+    # Left half (flatlay) is zeros, right half (on-model) is inpaint_mask downsampled
+    print(inpaint_mask.shape)
+    inpaint_mask_latent = torch.nn.functional.interpolate(
+        inpaint_mask,
+        size=(latent_height, latent_width),
+        mode='nearest'
+    )
+    left_zeros = torch.zeros_like(inpaint_mask_latent)
+    composite_mask_latent = torch.cat([left_zeros, inpaint_mask_latent], dim=3)  # [B, 1, H', 2*W']
+
+    # Rearrange mask to single channel if needed
+    if composite_mask_latent.shape[1] > 1:
+        composite_mask_latent = composite_mask_latent[:, 0, :, :]
+
+    # Convert mask to bfloat16
+    composite_mask_latent = composite_mask_latent.to(torch.bfloat16)
+
     # First rearrangement: 8x8 patches
-    mask = rearrange(
-        mask,
+    composite_mask_latent = rearrange(
+        composite_mask_latent,
         "b (h ph) (w pw) -> b (ph pw) h w",
         ph=8,
         pw=8,
     )
-    
-    # Second rearrangement: 2x2 patches
-    mask = rearrange(
-        mask, 
-        "b c (h ph) (w pw) -> b (h w) (c ph pw)", 
-        ph=2, 
-        pw=2
-    )
 
-    # Rearrange image latents similarly
-    image_latents = rearrange(
-        image_latents,
+    # Second rearrangement: 2x2 patches
+    composite_mask_latent = rearrange(
+        composite_mask_latent,
         "b c (h ph) (w pw) -> b (h w) (c ph pw)",
         ph=2,
         pw=2
     )
 
-    # Combine image and mask
-    image_cond = torch.cat([image_latents, mask], dim=-1)
+    # Rearrange latents similarly
+    composite_latents = rearrange(
+        composite_latents,
+        "b c (h ph) (w pw) -> b (h w) (c ph pw)",
+        ph=2,
+        pw=2
+    )
 
-    return image_cond, height, width
+    # Concatenate latents and mask
+    image_cond = torch.cat([composite_latents, composite_mask_latent], dim=-1)
+
+    return image_cond, composite_mask_latent.shape, composite_latents.shape
+
 
 def prepare_image_with_mask_sd3(
         image_processor,

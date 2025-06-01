@@ -1,10 +1,10 @@
-export MODEL_NAME="black-forest-labs/FLUX.1-dev"
+export MODEL_NAME="/home/lyra/development/consolidated-comfyui-models/diffusers/flux-fill-dev/"
 export INSTANCE_DIR="dog"
 export OUTPUT_DIR="trained-flux-inpaint"
 
 accelerate launch --config_file accelerate_config.yaml train_flux_inpaint.py \
   --pretrained_model_name_or_path=$MODEL_NAME  \
-  --pretrained_inpaint_model_name_or_path="xiaozaa/flux1-fill-dev-diffusers" \
+  --pretrained_inpaint_model_name_or_path="/home/lyra/development/consolidated-comfyui-models/diffusers/flux-fill-dev/" \
   --instance_data_dir=$INSTANCE_DIR \
   --output_dir=$OUTPUT_DIR \
   --mixed_precision="bf16" \

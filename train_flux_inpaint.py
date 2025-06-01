@@ -416,6 +416,7 @@ def main(args):
         log_with=args.report_to,
         project_config=accelerator_project_config,
         kwargs_handlers=[kwargs],
+        cpu=True # TODO
     )
 
     # Disable AMP for MPS.
@@ -454,41 +455,34 @@ def main(args):
                 exist_ok=True,
             ).repo_id
 
-    # Load the tokenizers
-    tokenizer_one = CLIPTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="tokenizer",
-        revision=args.revision,
-    )
-    tokenizer_two = T5TokenizerFast.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="tokenizer_2",
-        revision=args.revision,
+    ######## NEW
+
+    # ACCELERATE
+    pipe = FluxFillPipeline.from_pretrained(
+        "/home/lyra/development/consolidated-comfyui-models/diffusers/flux-fill-dev",
+        torch_dtype=torch.bfloat16
     )
 
-    # import correct text encoder classes
-    text_encoder_cls_one = import_model_class_from_model_name_or_path(
-        args.pretrained_model_name_or_path, args.revision
-    )
-    text_encoder_cls_two = import_model_class_from_model_name_or_path(
-        args.pretrained_model_name_or_path, args.revision, subfolder="text_encoder_2"
-    )
+    # Freeze all pipeline components
+    for component_name in ["transformer", "vae", "text_encoder", "text_encoder_2"]:
+        component = getattr(pipe, component_name, None)
+        if component is not None:
+            for param in component.parameters():
+                param.requires_grad = False
 
-    # Load scheduler and models
-    noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="scheduler"
-    )
-    noise_scheduler_copy = copy.deepcopy(noise_scheduler)
-    text_encoder_one, text_encoder_two = load_text_encoders(text_encoder_cls_one, text_encoder_cls_two)
-    vae = AutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="vae",
-        revision=args.revision,
-        variant=args.variant,
-    )
-    
+    # Unfreeze only self attention layers
+    component = getattr(pipe, "transformer", None)
+    if component is not None:
+        for name, param in component.named_parameters():
+            if "attn" in name:
+                param.requires_grad = True
+
+    noise_scheduler_copy = copy.deepcopy(pipe.scheduler)
+
+    ########
+
     vae_scale_factor = (
-        2 ** (len(vae.config.block_out_channels) - 1) if vae is not None else 8
+        2 ** (len(pipe.vae.config.block_out_channels) - 1) if pipe.vae is not None else 8
     )
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor, do_resize=True, do_convert_rgb=True, do_normalize=True)
     mask_processor = VaeImageProcessor(
@@ -498,99 +492,9 @@ def main(args):
         do_normalize=False,
         do_binarize=True,
     )
-    transformer = FluxTransformer2DModel.from_pretrained(
-        args.pretrained_inpaint_model_name_or_path, revision=args.revision, variant=args.variant
-    )
     
-
-
-    transformer.requires_grad_(False)
-    vae.requires_grad_(False)
-    text_encoder_one.requires_grad_(False)
-    text_encoder_two.requires_grad_(False)
-    
-    grad_params = [
-        "transformer_blocks.0.",
-        "transformer_blocks.1.",
-        "transformer_blocks.2.",
-        "transformer_blocks.3.",
-        "transformer_blocks.4.",
-        "transformer_blocks.5.",
-        "transformer_blocks.6.",
-        "transformer_blocks.7.",
-        "transformer_blocks.8.",
-        "transformer_blocks.9.",
-        "transformer_blocks.10.",
-        "transformer_blocks.11.",
-        "transformer_blocks.12.",
-        "transformer_blocks.13.",
-        "transformer_blocks.14.",
-        "transformer_blocks.15.",
-        "transformer_blocks.16.",
-        "transformer_blocks.17.",
-        "transformer_blocks.18.",
-        "single_transformer_blocks.0.",
-        "single_transformer_blocks.1.",
-        "single_transformer_blocks.2.",
-        "single_transformer_blocks.3.",
-        "single_transformer_blocks.4.",
-        "single_transformer_blocks.5.",
-        "single_transformer_blocks.6.",
-        "single_transformer_blocks.7.",
-        "single_transformer_blocks.8.",
-        "single_transformer_blocks.9.",
-        "single_transformer_blocks.10.",
-        "single_transformer_blocks.13.",
-        "single_transformer_blocks.14.",
-        "single_transformer_blocks.15.",
-        "single_transformer_blocks.16.",
-        "single_transformer_blocks.17.",
-        "single_transformer_blocks.18.",
-        "single_transformer_blocks.19.",
-        "single_transformer_blocks.20.",
-        "single_transformer_blocks.21.",
-        "single_transformer_blocks.22.",
-        "single_transformer_blocks.23.",
-        "single_transformer_blocks.24.",
-        "single_transformer_blocks.25.",
-        "single_transformer_blocks.26.",
-        "single_transformer_blocks.27.",
-        "single_transformer_blocks.28.",
-        "single_transformer_blocks.29.",
-        "single_transformer_blocks.30.",
-        "single_transformer_blocks.31.",
-        "single_transformer_blocks.32.",
-        "single_transformer_blocks.33.",
-        "single_transformer_blocks.34.",
-        "single_transformer_blocks.35.",
-        "single_transformer_blocks.36.",
-        "single_transformer_blocks.37.",
-    ]
-
-    if args.train_base_model:
-        transformer.requires_grad_(False)  # Set all parameters to not require gradients by default
-        
-        for name, param in transformer.named_parameters():
-            if any(grad_param in name for grad_param in grad_params):
-                if ("attn" in name):
-                    param.requires_grad = True
-                    print(f"Enabling gradients for: {name}")
-        
-    else:
-        transformer.requires_grad_(False)   
-
-
-    # #you can train your own layers
-    # for n, param in transformer.named_parameters():
-    #     print(n)
-    #     if 'single_transformer_blocks' in n:
-    #         param.requires_grad = False
-    #     elif 'transformer_blocks' in n and '1.attn' in n:
-    #         param.requires_grad = True
-    #     else:
-    #         param.requires_grad = False
-    
-    print(sum([p.numel() for p in transformer.parameters() if p.requires_grad]) / 1000000, 'transformer parameters')
+    trainable_params = sum(p.numel() for p in pipe.transformer.parameters() if p.requires_grad)
+    print(f"{trainable_params:,.3f} transformer parameters")
 
     # For mixed precision training we cast all non-trainable weights (vae, text_encoder and transformer) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
@@ -606,16 +510,12 @@ def main(args):
             "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
         )
 
-    vae.to(accelerator.device, dtype=weight_dtype)
-    text_encoder_one.to(accelerator.device, dtype=weight_dtype)
-    text_encoder_two.to(accelerator.device, dtype=weight_dtype)
-    transformer.to(accelerator.device, dtype=weight_dtype)
-
+    # TODO
+    # pipe.to(accelerator.device, dtype=weight_dtype)
 
     if args.gradient_checkpointing:
         if args.train_base_model:
-            transformer.enable_gradient_checkpointing()
-        
+            pipe.transformer.enable_gradient_checkpointing()
 
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
@@ -688,7 +588,7 @@ def main(args):
 
     # Optimization parameters
     if args.train_base_model:
-        transformer_parameters_with_lr = {"params": transformer.parameters(), "lr": args.learning_rate}
+        transformer_parameters_with_lr = {"params": pipe.transformer.parameters(), "lr": args.learning_rate}
    
     params_to_optimize = [transformer_parameters_with_lr]
 
@@ -776,6 +676,7 @@ def main(args):
         data_list=args.validation_data_list,
     )
 
+    # TODO SET TO TRUE?!
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=False,
@@ -794,8 +695,8 @@ def main(args):
         batch_size=args.train_batch_size,
     )
 
-    tokenizers = [tokenizer_one, tokenizer_two]
-    text_encoders = [text_encoder_one, text_encoder_two]
+    tokenizers = [pipe.tokenizer, pipe.tokenizer_2]
+    text_encoders = [pipe.text_encoder, pipe.text_encoder_2]
 
     def compute_text_embeddings(prompt, text_encoders, tokenizers):
         with torch.no_grad():
@@ -833,14 +734,11 @@ def main(args):
         num_cycles=args.lr_num_cycles,
         power=args.lr_power,
     )
-
-
-    if args.train_base_model:
-        transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            transformer, optimizer, train_dataloader, lr_scheduler
-        )
-
-    
+    # TODO
+#    if args.train_base_model:
+#        pipe.transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+#            pipe.transformer, optimizer, train_dataloader, lr_scheduler
+#        )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -919,68 +817,64 @@ def main(args):
 
     for epoch in range(first_epoch, args.num_train_epochs):
         if args.train_base_model:
-            transformer.train()
+            pipe.transformer.train()
         
         for step, batch in enumerate(train_dataloader):
             if args.train_base_model:
-                models_to_accumulate = [transformer]
+                models_to_accumulate = [pipe.transformer]
             
             
             with accelerator.accumulate(models_to_accumulate):
-                # vae_scale_factor = 2 ** (len(vae.config.block_out_channels))
-                batch_size = batch["image"].shape[0]
-                pixel_values = batch["image"].to(dtype=vae.dtype)
-                # prompts = batch["caption_cloth"]
+                batch_size = batch["on_model_image_masked"].shape[0]
+
                 prompts = [""
-                    f"The pair of images highlights a clothing and its styling on a model, high resolution, 4K, 8K; "
+                    f"The pair of images highlights a clothing and its styling on a model."
                     f"[IMAGE1] Detailed product shot of a clothing"
                     f"[IMAGE2] The same cloth is worn by a model in a lifestyle setting."
-                    # "[IMAGE1] A sleek black long-sleeved top is displayed against a neutral backdrop, featuring distinctive elbow pads, "
-                    # "a classic round neckline, and a cropped silhouette that combines 90s-inspired design with modern minimalism. "
-                    # "The garment showcases clean lines and a fitted cut, embracing realistic body proportions; "
-                    # "[IMAGE2] The same top is worn by a model in a lifestyle setting, where the versatile black fabric drapes naturally, "
-                    # "emphasizing its superflat construction and thin material. The styling creates a retro-contemporary fusion, "
-                    # "reminiscent of 60s fashion while maintaining a timeless cloud jumper aesthetic, all captured in a sophisticated black box presentation."
-                ] * len(pixel_values)
-                # prompts = ["upperbody"] * len(pixel_values)
+                ] * batch_size
 
-                control_mask = batch["inpaint_mask"].to(dtype=vae.dtype)
-                control_image = batch["im_mask"].to(dtype=vae.dtype)
-                garment_image = batch["cloth_pure"]
-                # garment_image_0_1 = (batch["cloth_pure"] + 1.0) / 2
-                garment_image = garment_image.to(dtype=vae.dtype)
-                
-                
-                # print("image_proj.shape", image_proj.shape)
 
-                # encode batch prompts when custom prompts are provided for each image -
-                prompt_embeds, pooled_prompt_embeds, text_ids = compute_text_embeddings(
-                    prompts, text_encoders, tokenizers
-                )
-                
+                # model_input = torch.cat([flatlay_latent, on_model_image_masked_latent], dim=2)
+                # model_input = torch.cat([cloth_latent, on_model_latent], dim=-1)
+
+                # TODO: What about mask latent?
+                # TODO: prepare_fill_with_mask
+
+                ### NEW
+                inpaint_mask = batch["inpaint_mask"].to(dtype=pipe.vae.dtype)
+                ground_truth_image = batch["ground_truth_image"].to(dtype=pipe.vae.dtype)
+
+                on_model_image_masked = batch["on_model_image_masked"].to(dtype=pipe.vae.dtype)
+                flatlay_image = batch["flatlay_image"].to(dtype=pipe.vae.dtype)
+
+
+                if not isinstance(on_model_image_masked, torch.Tensor):
+                    on_model_image_masked = image_processor.preprocess(on_model_image_masked, height=args.height, width=args.width)
+                if not isinstance(flatlay_image, torch.Tensor):
+                    flatlay_image = image_processor.preprocess(flatlay_image, height=args.height, width=args.width)
+                if not isinstance(inpaint_mask, torch.Tensor):
+                    inpaint_mask = mask_processor.preprocess(inpaint_mask, height=args.height, width=args.width*2)
+
                 inpaint_cond, _, _ = prepare_fill_with_mask(
-                    image_processor=image_processor,
-                    mask_processor=mask_processor,
-                    vae=vae,
+                    vae=pipe.vae,
                     vae_scale_factor=vae_scale_factor,
-                    image=control_image,
-                    mask=control_mask,
-                    width=args.width*2,
-                    height=args.height,
+                    on_model_image_masked=on_model_image_masked,
+                    flatlay_image=flatlay_image,
+                    inpaint_mask=inpaint_mask,
                     batch_size=batch_size,
                     num_images_per_prompt=1,
                     device=accelerator.device,
                     dtype=weight_dtype,
                 )
-                
+
+                # encode batch prompts when custom prompts are provided for each image -
+                prompt_embeds, pooled_prompt_embeds, text_ids = compute_text_embeddings(prompts, text_encoders, tokenizers)
                 
                 # TODO: controlnet dropout might cause instability, need to run more experiments
                 if args.dropout_prob > 0:
                     dropout = torch.nn.Dropout(p=args.dropout_prob)
                     inpaint_cond = dropout(inpaint_cond)
 
-                model_input = encode_images_to_latents(vae, pixel_values, weight_dtype, args.height, args.width*2)
-                
                 latent_image_ids = prepare_latents(
                     vae_scale_factor,
                     batch_size,
