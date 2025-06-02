@@ -73,47 +73,52 @@ def prepare_image_with_mask(
 
         return packed_control_image, height, width
 
+
 def prepare_fill_with_mask(
     vae,
     vae_scale_factor,
-    on_model_image_masked,  # [B, C, H, W] in pixel space
-    flatlay_image,          # [B, C, H, W] in pixel space
-    inpaint_mask,           # [B, 1, H, W] in pixel space
+    on_model_image_masked,
+    flatlay_image,
+    inpaint_mask,
     batch_size,
     num_images_per_prompt,
     device,
     dtype,
 ):
     """
-    Prepares latents and mask for fill operation with separate encoding of on_model_image_masked and flatlay_image.
-    Concatenates latents after encoding and processes inpaint_mask accordingly.
+    Prepare latents and mask for fill operation with separate encoding of on_model_image_masked and flatlay_image.
+    Mask is interpolated to latent size before concatenation, matching CatVTON logic.
     """
     effective_batch_size = batch_size * num_images_per_prompt
 
-    # Repeat inputs if needed
-    if on_model_image_masked.shape[0] == 1:
-        on_model_image_masked = on_model_image_masked.repeat(effective_batch_size, 1, 1, 1)
-    else:
-        on_model_image_masked = on_model_image_masked.repeat(num_images_per_prompt, 1, 1, 1)
+    if effective_batch_size > 1:
+        # Repeat inputs if needed
+        if on_model_image_masked.shape[0] == 1:
+            on_model_image_masked = on_model_image_masked.repeat(effective_batch_size, 1, 1, 1)
+        else:
+            on_model_image_masked = on_model_image_masked.repeat(num_images_per_prompt, 1, 1, 1)
 
-    if flatlay_image.shape[0] == 1:
-        flatlay_image = flatlay_image.repeat(effective_batch_size, 1, 1, 1)
-    else:
-        flatlay_image = flatlay_image.repeat(num_images_per_prompt, 1, 1, 1)
+        if flatlay_image.shape[0] == 1:
+            flatlay_image = flatlay_image.repeat(effective_batch_size, 1, 1, 1)
+        else:
+            flatlay_image = flatlay_image.repeat(num_images_per_prompt, 1, 1, 1)
 
-    if inpaint_mask.shape[0] == 1:
-        inpaint_mask = inpaint_mask.repeat(effective_batch_size, 1, 1, 1)
-    else:
-        inpaint_mask = inpaint_mask.repeat(num_images_per_prompt, 1, 1, 1)
+        if inpaint_mask.shape[0] == 1:
+            inpaint_mask = inpaint_mask.repeat(effective_batch_size, 1, 1, 1)
+        else:
+            inpaint_mask = inpaint_mask.repeat(num_images_per_prompt, 1, 1, 1)
 
     # Move to device and dtype
     on_model_image_masked = on_model_image_masked.to(device=device, dtype=dtype)
     flatlay_image = flatlay_image.to(device=device, dtype=dtype)
     inpaint_mask = inpaint_mask.to(device=device, dtype=dtype)
+    print(f"inpaint_mask shape: {inpaint_mask.shape}")  # [B, C, H, 2*W]
 
     # Encode images separately
     on_model_latents = vae.encode(on_model_image_masked.to(vae.dtype)).latent_dist.sample()
     flatlay_latents = vae.encode(flatlay_image.to(vae.dtype)).latent_dist.sample()
+    print(f"on_model_latents shape: {on_model_latents.shape}")  # [B, C, H', W']
+    print(f"flatlay_latents shape: {flatlay_latents.shape}")  # [B, C, H', W']
 
     # Adjust latents
     on_model_latents = (on_model_latents - vae.config.shift_factor) * vae.config.scaling_factor
@@ -124,58 +129,46 @@ def prepare_fill_with_mask(
 
     # Concatenate latents along width (dim=3)
     composite_latents = torch.cat([flatlay_latents, on_model_latents], dim=3)  # [B, C, H', 2*W']
+    print(f"composite_latents shape: {composite_latents.shape}")
 
-    # Resize inpaint_mask to latent spatial size
-    latent_height = on_model_latents.shape[2]  # H'
-    latent_width = on_model_latents.shape[3]   # W'
-    # The concatenated latent is [B, C, H', 2*W']
-
-    # Prepare mask for the concatenated latent:
-    # Left half (flatlay) is zeros, right half (on-model) is inpaint_mask downsampled
-    print(inpaint_mask.shape)
-    inpaint_mask_latent = torch.nn.functional.interpolate(
-        inpaint_mask,
-        size=(latent_height, latent_width),
-        mode='nearest'
-    )
-    left_zeros = torch.zeros_like(inpaint_mask_latent)
-    composite_mask_latent = torch.cat([left_zeros, inpaint_mask_latent], dim=3)  # [B, 1, H', 2*W']
-
-    # Rearrange mask to single channel if needed
-    if composite_mask_latent.shape[1] > 1:
-        composite_mask_latent = composite_mask_latent[:, 0, :, :]
-
-    # Convert mask to bfloat16
-    composite_mask_latent = composite_mask_latent.to(torch.bfloat16)
-
+    # Process mask
+    # TODO THis works very similar to the original code. However, the final conditioning is heavily influenced by the mask, as the mask patchify is much bigger then the composite pathify
+    mask = inpaint_mask[:, 0, :, :] if inpaint_mask.shape[1] > 1 else inpaint_mask[:, 0, :, :]
+    mask = mask.to(torch.bfloat16)
+    print(f"mask shape: {mask.shape}")
+    
     # First rearrangement: 8x8 patches
-    composite_mask_latent = rearrange(
-        composite_mask_latent,
+    mask = rearrange(
+        mask,
         "b (h ph) (w pw) -> b (ph pw) h w",
         ph=8,
         pw=8,
     )
-
+    print(f"mask shape after 8x8 rearrange: {mask.shape}")
+    
     # Second rearrangement: 2x2 patches
-    composite_mask_latent = rearrange(
-        composite_mask_latent,
-        "b c (h ph) (w pw) -> b (h w) (c ph pw)",
-        ph=2,
+    mask = rearrange(
+        mask, 
+        "b c (h ph) (w pw) -> b (h w) (c ph pw)", 
+        ph=2, 
         pw=2
     )
+    print(f"mask shape after 2x2 rearrange: {mask.shape}")
 
     # Rearrange latents similarly
-    composite_latents = rearrange(
+    rearranged_composite_latents = rearrange(
         composite_latents,
         "b c (h ph) (w pw) -> b (h w) (c ph pw)",
         ph=2,
         pw=2
     )
+    print(f"rearranged composite_latents shape: {rearranged_composite_latents.shape}")
 
     # Concatenate latents and mask
-    image_cond = torch.cat([composite_latents, composite_mask_latent], dim=-1)
+    image_cond = torch.cat([rearranged_composite_latents, mask], dim=-1)
+    print(f"image_cond shape: {image_cond.shape}")
 
-    return image_cond, composite_mask_latent.shape, composite_latents.shape
+    return image_cond, composite_latents
 
 
 def prepare_image_with_mask_sd3(

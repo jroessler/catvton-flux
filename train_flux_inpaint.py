@@ -49,6 +49,7 @@ from diffusers import FluxTransformer2DModel, FluxFillPipeline
 # from src.flux.pipeline_flux_inpaint import FluxInpaintingPipeline
 from diffusers.image_processor import VaeImageProcessor
 from deepspeed.runtime.engine import DeepSpeedEngine
+from torchvision.utils import save_image
 
 import diffusers
 from diffusers import (
@@ -243,6 +244,26 @@ def log_validation(
     return images
 
 
+def save_tensor_as_image(tensor_image, index=0, folder="data/examples", filename_prefix='ground_truth'):
+    # Create the directory if it doesn't exist
+    os.makedirs(folder, exist_ok=True)
+
+    # Select the image at the given index and move to CPU
+    img_tensor = tensor_image[index].detach().cpu()
+    print(f"Shape of {filename_prefix}: {img_tensor.shape}")
+
+    # Unnormalize
+    img_tensor = img_tensor * 0.5 + 0.5
+
+    # Clamp to [0, 1] just in case
+    img_tensor = torch.clamp(img_tensor, 0, 1)
+
+    # Save the image
+    save_path = os.path.join(folder, f'{filename_prefix}_{index}.png')
+    save_image(img_tensor, save_path)
+    return save_path
+
+
 def import_model_class_from_model_name_or_path(
     pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
 ):
@@ -416,7 +437,6 @@ def main(args):
         log_with=args.report_to,
         project_config=accelerator_project_config,
         kwargs_handlers=[kwargs],
-        cpu=True # TODO
     )
 
     # Disable AMP for MPS.
@@ -455,11 +475,8 @@ def main(args):
                 exist_ok=True,
             ).repo_id
 
-    ######## NEW
-
-    # ACCELERATE
     pipe = FluxFillPipeline.from_pretrained(
-        "/home/lyra/development/consolidated-comfyui-models/diffusers/flux-fill-dev",
+        "black-forest-labs/FLUX.1-Fill-dev",
         torch_dtype=torch.bfloat16
     )
 
@@ -478,8 +495,6 @@ def main(args):
                 param.requires_grad = True
 
     noise_scheduler_copy = copy.deepcopy(pipe.scheduler)
-
-    ########
 
     vae_scale_factor = (
         2 ** (len(pipe.vae.config.block_out_channels) - 1) if pipe.vae is not None else 8
@@ -509,9 +524,8 @@ def main(args):
         raise ValueError(
             "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
         )
-
-    # TODO
-    # pipe.to(accelerator.device, dtype=weight_dtype)
+    
+    pipe = pipe.to(accelerator.device, dtype=weight_dtype)
 
     if args.gradient_checkpointing:
         if args.train_base_model:
@@ -734,11 +748,11 @@ def main(args):
         num_cycles=args.lr_num_cycles,
         power=args.lr_power,
     )
-    # TODO
-#    if args.train_base_model:
-#        pipe.transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-#            pipe.transformer, optimizer, train_dataloader, lr_scheduler
-#        )
+
+    if args.train_base_model:
+        pipe.transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            pipe.transformer, optimizer, train_dataloader, lr_scheduler
+        )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -843,9 +857,12 @@ def main(args):
                 ### NEW
                 inpaint_mask = batch["inpaint_mask"].to(dtype=pipe.vae.dtype)
                 ground_truth_image = batch["ground_truth_image"].to(dtype=pipe.vae.dtype)
+                save_tensor_as_image(ground_truth_image, filename_prefix='ground_truth')
 
                 on_model_image_masked = batch["on_model_image_masked"].to(dtype=pipe.vae.dtype)
+                save_tensor_as_image(on_model_image_masked, filename_prefix='on_model_image_masked')
                 flatlay_image = batch["flatlay_image"].to(dtype=pipe.vae.dtype)
+                save_tensor_as_image(flatlay_image, filename_prefix='flatlay_image')
 
 
                 if not isinstance(on_model_image_masked, torch.Tensor):
@@ -855,7 +872,7 @@ def main(args):
                 if not isinstance(inpaint_mask, torch.Tensor):
                     inpaint_mask = mask_processor.preprocess(inpaint_mask, height=args.height, width=args.width*2)
 
-                inpaint_cond, _, _ = prepare_fill_with_mask(
+                inpaint_cond, model_input = prepare_fill_with_mask(
                     vae=pipe.vae,
                     vae_scale_factor=vae_scale_factor,
                     on_model_image_masked=on_model_image_masked,
@@ -926,7 +943,7 @@ def main(args):
                 # print("guidance", guidance, "pooled_prompt_embeds.shape", pooled_prompt_embeds.shape, "prompt_embeds.shape", prompt_embeds.shape)
                 
                 # Predict the noise residual
-                model_pred = transformer(
+                model_pred = pipe.transformer(
                     hidden_states=packed_noisy_model_input,
                     # YiYi notes: divide it by 1000 for now because we scale it by 1000 in the transforme rmodel (we should not keep it but I want to keep the inputs same for the model for testing)
                     timestep=timesteps / 1000,
@@ -949,6 +966,7 @@ def main(args):
 
                 # these weighting schemes use a uniform timestep sampling
                 # and instead post-weight the loss
+                # TODO CHECK!
                 weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
 
                 # flow matching loss
