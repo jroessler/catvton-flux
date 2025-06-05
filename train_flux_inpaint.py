@@ -477,7 +477,7 @@ def main(args):
 
     pipe = FluxFillPipeline.from_pretrained(
         "black-forest-labs/FLUX.1-Fill-dev",
-        torch_dtype=torch.bfloat16
+        low_cpu_mem_usage=False
     )
 
     # Freeze all pipeline components
@@ -525,7 +525,10 @@ def main(args):
             "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
         )
     
-    pipe = pipe.to(accelerator.device, dtype=weight_dtype)
+    # pipe = pipe.to(accelerator.device, dtype=weight_dtype)
+    pipe.vae.to(accelerator.device, dtype=weight_dtype)
+    pipe.text_encoder.to(accelerator.device, dtype=weight_dtype)
+    pipe.text_encoder_2.to(accelerator.device, dtype=weight_dtype)
 
     if args.gradient_checkpointing:
         if args.train_base_model:
